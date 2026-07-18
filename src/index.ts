@@ -29,6 +29,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type LiveProgress, projectChildEvent } from "./live-progress.js";
 import { mapSettledWithConcurrency } from "./parallel.js";
 import {
 	DEFAULT_TIMEOUT_SECONDS,
@@ -173,6 +174,7 @@ interface SingleResult {
 	elapsedMs?: number;
 	lastAction?: string;
 	transcriptPath?: string;
+	liveProgress?: LiveProgress;
 }
 
 interface SubagentDetails {
@@ -195,7 +197,11 @@ function getFinalOutput(messages: Message[]): string {
 }
 
 function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return (
+		(result.exitCode !== 0 && result.exitCode !== -1) ||
+		result.stopReason === "error" ||
+		result.stopReason === "aborted"
+	);
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -298,7 +304,7 @@ async function runSingleAgent(
 		agent: agentName,
 		agentSource: agent.source,
 		task,
-		exitCode: 0,
+		exitCode: -1,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -306,13 +312,30 @@ async function runSingleAgent(
 		step,
 	};
 
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
+	let updateTimer: NodeJS.Timeout | undefined;
+	let lastUpdateAt = 0;
+	const performUpdate = () => {
+		updateTimer = undefined;
+		lastUpdateAt = Date.now();
+		const liveText = currentResult.liveProgress?.partialText;
+		onUpdate?.({
+			content: [{ type: "text", text: liveText || getFinalOutput(currentResult.messages) || "(running...)" }],
+			details: makeDetails([currentResult]),
+		});
+	};
+	const emitUpdate = (immediate = false) => {
+		if (!onUpdate) return;
+		const remaining = 100 - (Date.now() - lastUpdateAt);
+		if (immediate || remaining <= 0) {
+			if (updateTimer) clearTimeout(updateTimer);
+			performUpdate();
+		} else if (!updateTimer) {
+			updateTimer = setTimeout(performUpdate, remaining);
 		}
+	};
+	const cancelPendingUpdate = () => {
+		if (updateTimer) clearTimeout(updateTimer);
+		updateTimer = undefined;
 	};
 
 	try {
@@ -340,6 +363,11 @@ async function runSingleAgent(
 				return;
 			}
 
+			const projected = projectChildEvent(currentResult.liveProgress, event);
+			if (projected.changed) currentResult.liveProgress = projected.progress;
+			let shouldUpdate = projected.changed;
+			let immediate = projected.immediate;
+
 			if (event.type === "message_end" && event.message) {
 				const msg = event.message as Message;
 				currentResult.messages.push(msg);
@@ -360,13 +388,16 @@ async function runSingleAgent(
 					if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 					if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 				}
-				emitUpdate();
+				shouldUpdate = true;
+				immediate = true;
 			}
 
 			if (event.type === "tool_result_end" && event.message) {
 				currentResult.messages.push(event.message as Message);
-				emitUpdate();
+				shouldUpdate = true;
+				immediate = true;
 			}
+			if (shouldUpdate) emitUpdate(immediate);
 			if (currentResult.usage.turns >= limits.maxTurns) return "turn-limit";
 			if (toolCalls >= limits.maxToolCalls) return "tool-call-limit";
 		};
@@ -391,14 +422,17 @@ async function runSingleAgent(
 			onStderr: (text) => {
 				currentResult.stderr += text;
 			},
-			onHeartbeat: ({ elapsedMs, lastAction }) => {
-				onUpdate?.({
-					content: [{ type: "text", text: `${agentName}: ${Math.round(elapsedMs / 1000)}s elapsed; ${lastAction}` }],
-					details: makeDetails([currentResult]),
-				});
+			onHeartbeat: ({ elapsedMs }) => {
+				currentResult.liveProgress = {
+					...(currentResult.liveProgress ?? { phase: "starting", partialText: "", activeTools: [] }),
+					elapsedMs,
+				};
+				emitUpdate(true);
 			},
 		});
 
+		cancelPendingUpdate();
+		currentResult.liveProgress = undefined;
 		currentResult.exitCode = processResult.exitCode;
 		currentResult.termination = processResult.termination;
 		currentResult.elapsedMs = processResult.elapsedMs;
@@ -410,11 +444,14 @@ async function runSingleAgent(
 		}
 		return currentResult;
 	} catch (error) {
+		cancelPendingUpdate();
+		currentResult.liveProgress = undefined;
 		currentResult.exitCode = 1;
 		currentResult.stopReason = "error";
 		currentResult.errorMessage = error instanceof Error ? error.message : String(error);
 		return currentResult;
 	} finally {
+		cancelPendingUpdate();
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -804,17 +841,46 @@ export default function (pi: ExtensionAPI) {
 				return text.trimEnd();
 			};
 
+			const renderLiveProgress = (progress: LiveProgress | undefined) => {
+				if (!progress) return "";
+				const lines: string[] = [];
+				const elapsed = progress.elapsedMs === undefined ? "" : ` ${Math.round(progress.elapsedMs / 1000)}s`;
+				if (progress.activeTools.length > 0) {
+					for (const tool of progress.activeTools) {
+						lines.push(
+							theme.fg("warning", "⏳ ") +
+								formatToolCall(tool.name, tool.args, theme.fg.bind(theme)) +
+								theme.fg("dim", elapsed),
+						);
+					}
+				} else if (progress.partialText) {
+					const maxLines = expanded ? 20 : 3;
+					lines.push(theme.fg("toolOutput", progress.partialText.split("\n").slice(-maxLines).join("\n")));
+				} else {
+					const label = progress.phase === "starting" ? "starting…" : "thinking…";
+					lines.push(theme.fg("muted", `${label}${elapsed}`));
+				}
+				return lines.join("\n");
+			};
+
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
+				const isRunning = r.exitCode === -1;
 				const isError = isFailedResult(r);
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const icon = isRunning
+					? theme.fg("warning", "⏳")
+					: isError
+						? theme.fg("error", "✗")
+						: theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
+				const liveProgress = renderLiveProgress(r.liveProgress);
 
 				if (expanded) {
 					const container = new Container();
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+					if (isRunning) header += ` ${theme.fg("warning", "[running]")}`;
+					else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (isError && r.errorMessage)
 						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
@@ -823,8 +889,8 @@ export default function (pi: ExtensionAPI) {
 					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+					if (displayItems.length === 0 && !finalOutput && !liveProgress) {
+						container.addChild(new Text(theme.fg("muted", isRunning ? "(running...)" : "(no output)"), 0, 0));
 					} else {
 						for (const item of displayItems) {
 							if (item.type === "toolCall")
@@ -840,6 +906,10 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Spacer(1));
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
+						if (liveProgress) {
+							container.addChild(new Spacer(1));
+							container.addChild(new Text(liveProgress, 0, 0));
+						}
 					}
 					const usageStr = formatUsageStats(r.usage, r.model);
 					if (usageStr) {
@@ -850,11 +920,14 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				if (isRunning) text += ` ${theme.fg("warning", "[running]")}`;
+				else if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+				else if (displayItems.length === 0 && !liveProgress)
+					text += `\n${theme.fg("muted", isRunning ? "(running...)" : "(no output)")}`;
 				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+					if (displayItems.length > 0) text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+					if (liveProgress) text += `\n${liveProgress}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
@@ -945,11 +1018,21 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon =
+						r.exitCode === -1
+							? theme.fg("warning", "⏳")
+							: r.exitCode === 0
+								? theme.fg("success", "✓")
+								: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
+					const liveProgress = renderLiveProgress(r.liveProgress);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					if (displayItems.length === 0 && !liveProgress)
+						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+					else {
+						if (displayItems.length > 0) text += `\n${renderDisplayItems(displayItems, 5)}`;
+						if (liveProgress) text += `\n${liveProgress}`;
+					}
 				}
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
 				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
@@ -1033,10 +1116,14 @@ export default function (pi: ExtensionAPI) {
 								? theme.fg("error", "✗")
 								: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
+					const liveProgress = renderLiveProgress(r.liveProgress);
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0)
+					if (displayItems.length === 0 && !liveProgress)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					else {
+						if (displayItems.length > 0) text += `\n${renderDisplayItems(displayItems, 5)}`;
+						if (liveProgress) text += `\n${liveProgress}`;
+					}
 				}
 				if (!isRunning) {
 					const usageStr = formatUsageStats(aggregateUsage(details.results));

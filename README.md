@@ -13,6 +13,7 @@ The extension runtime and its canonical `general-purpose` agent definition live 
 - Spawned children receive no nested-delegation budget by default. A root caller may explicitly grant at most two additional generations with `nestingBudget`.
 - Child Pi runs in its own process group. Timeout and abort send `SIGTERM`, then `SIGKILL` after five seconds if the group has not closed.
 - Internal parallel mode uses all-settled aggregation so one failure does not discard completed siblings.
+- Partial response text, thinking status, and active tool calls stream into the parent Pi TUI, throttled to avoid excessive rendering.
 - A heartbeat is emitted every fifteen seconds with elapsed time and the last observed child action.
 - Raw child events, stderr, metadata, and termination events are stored under `~/.pi/agent/subagent-runs/` with user-only file permissions. Completed runs older than seven days or beyond 100 MB total are pruned oldest-first; abandoned runs are removed after one hour.
 
