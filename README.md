@@ -1,5 +1,7 @@
 # Pi Subagent
 
+[![CI](https://github.com/matteo-greco/pi-subagent/actions/workflows/ci.yml/badge.svg)](https://github.com/matteo-greco/pi-subagent/actions/workflows/ci.yml)
+
 A user-owned replacement for Pi's example `subagent` extension. It preserves the `subagent` tool name and existing single, parallel, and chain modes while placing mechanical bounds around child execution.
 
 The extension runtime and its canonical `general-purpose` agent definition live together in this repository. Runtime implementation is under `src/`; installable agent definitions are under `agents/`.
